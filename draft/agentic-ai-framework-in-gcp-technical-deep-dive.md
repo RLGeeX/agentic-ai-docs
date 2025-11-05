@@ -33,6 +33,131 @@ While the overview document answers "what" and "why," this deep-dive answers:
 - **Making design decisions**: Review section 6 (ADRs) for documented tradeoffs
 - **Planning deployment**: Use section 7 for topology guidance
 
+### Full System Architecture
+
+The following diagram shows the complete GCP architecture with all major services and their interactions:
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        Client[Client Application]
+    end
+
+    subgraph "API Gateway & Load Balancing"
+        GLB[Global Load Balancer]
+        CloudArmor[Cloud Armor WAF]
+        APIGateway[API Gateway / Cloud Endpoints]
+    end
+
+    subgraph "Orchestration Layer - Cloud Run"
+        Orchestrator[LangGraph Orchestrator<br/>Cloud Run Service]
+    end
+
+    subgraph "LLM & Embedding Services"
+        VertexAI[Vertex AI Gemini API<br/>LLM Reasoning]
+        EmbedAPI[Vertex AI Text Embedding API<br/>textembedding-gecko@003]
+    end
+
+    subgraph "RAG & Retrieval Layer"
+        VectorSearch[Vertex AI Vector Search<br/>TREE_AH Algorithm]
+        BigQuery[BigQuery<br/>Keyword Search BM25]
+        HybridRetriever[Hybrid Retriever<br/>Cloud Run Service<br/>RRF Merge]
+    end
+
+    subgraph "Tool Execution Layer"
+        ToolRegistry[Tool Registry<br/>Firestore Collection]
+        CF1[Cloud Run function<br/>fetch_q3_sales]
+        CF2[Cloud Run function<br/>analyze_sentiment]
+        CF3[Cloud Run function<br/>search_external_api]
+    end
+
+    subgraph "State & Data Storage"
+        Firestore[Firestore Native Mode<br/>Session State & LTM]
+        GCS[Cloud Storage<br/>Documents & Index Files]
+        SecretMgr[Secret Manager<br/>API Keys & Credentials]
+    end
+
+    subgraph "Document Processing Pipeline"
+        PubSub[Pub/Sub Topic<br/>doc-processing]
+        ProcessFunc[Cloud Run function<br/>process-document]
+        IndexFunc[Cloud Run function<br/>update-vector-index]
+        DocAI[Document AI<br/>PDF Processing]
+    end
+
+    subgraph "Monitoring & Observability"
+        CloudTrace[Cloud Trace<br/>Distributed Tracing]
+        CloudMon[Cloud Monitoring<br/>Metrics & Alerts]
+        CloudLog[Cloud Logging<br/>Centralized Logs]
+    end
+
+    %% Client to API Gateway
+    Client -->|HTTPS Request| GLB
+    GLB --> CloudArmor
+    CloudArmor --> APIGateway
+
+    %% API Gateway to Orchestrator
+    APIGateway -->|REST/gRPC| Orchestrator
+
+    %% Orchestrator interactions
+    Orchestrator -->|LLM Reasoning| VertexAI
+    Orchestrator -->|Read/Write State| Firestore
+    Orchestrator -->|Query Embeddings| HybridRetriever
+    Orchestrator -->|Lookup Tool Schema| ToolRegistry
+    Orchestrator -->|Invoke Tools| CF1
+    Orchestrator -->|Invoke Tools| CF2
+    Orchestrator -->|Invoke Tools| CF3
+
+    %% Hybrid Retrieval
+    HybridRetriever -->|Query Embedding| EmbedAPI
+    HybridRetriever -->|Vector Search| VectorSearch
+    HybridRetriever -->|Keyword Search| BigQuery
+    HybridRetriever -->|Fetch Chunks| GCS
+
+    %% Vector Search & Index
+    VectorSearch -->|Read Index Files| GCS
+
+    %% Tool execution
+    CF1 -->|Query Data| BigQuery
+    CF2 -->|Read Secrets| SecretMgr
+    CF3 -->|Access External APIs| SecretMgr
+
+    %% Document Processing Pipeline
+    GCS -->|storage.finalize| PubSub
+    PubSub -->|Trigger| ProcessFunc
+    ProcessFunc -->|Process PDFs| DocAI
+    ProcessFunc -->|Generate Embeddings| EmbedAPI
+    ProcessFunc -->|Stream Embeddings| IndexFunc
+    IndexFunc -->|Update Index| VectorSearch
+    IndexFunc -->|Update Metadata| Firestore
+
+    %% Observability
+    Orchestrator -.->|Traces| CloudTrace
+    HybridRetriever -.->|Traces| CloudTrace
+    CF1 -.->|Traces| CloudTrace
+    CF2 -.->|Traces| CloudTrace
+    CF3 -.->|Traces| CloudTrace
+
+    Orchestrator -.->|Metrics| CloudMon
+    VectorSearch -.->|Metrics| CloudMon
+
+    Orchestrator -.->|Logs| CloudLog
+    ProcessFunc -.->|Logs| CloudLog
+    IndexFunc -.->|Logs| CloudLog
+
+    style Client fill:#e1f5ff
+    style Orchestrator fill:#fff4e6
+    style VertexAI fill:#f3e5f5
+    style VectorSearch fill:#e8f5e9
+    style Firestore fill:#fff9c4
+    style GCS fill:#fff9c4
+```
+
+**Key Flows**:
+1. **User Query**: Client → GLB → API Gateway → Orchestrator → LLM + RAG → Response
+2. **Document Ingestion**: GCS Upload → Pub/Sub → Processing Function → Embedding → Index Update
+3. **Tool Execution**: Orchestrator → Tool Registry Lookup → Cloud Function Invocation → Result Return
+4. **State Management**: Orchestrator ↔ Firestore (read/write session state throughout ReAct loop)
+
 ---
 
 ## **2. RAG Implementation Architecture**
@@ -44,7 +169,7 @@ Retrieval-Augmented Generation (RAG) ensures grounded, citation-backed responses
 **Service Stack:**
 - **Vertex AI Text Embedding API**: Generates dense vector embeddings using `textembedding-gecko@003` model (768 dimensions)
 - **Cloud Storage**: Raw document storage (PDFs, Markdown, structured data exports)
-- **Cloud Functions (2nd Gen)**: Document processing orchestration
+- **Cloud Run functions**: Document processing orchestration
 - **Pub/Sub**: Async event-driven triggering for new/updated documents
 
 **Pipeline Flow:**
@@ -52,7 +177,7 @@ Retrieval-Augmented Generation (RAG) ensures grounded, citation-backed responses
 1. **Document Ingestion**
    - Documents uploaded to **Cloud Storage bucket** (`gs://docs-raw/`)
    - Storage trigger fires **Pub/Sub topic** (`doc-processing`)
-   - Cloud Function (`process-document`) subscribes to topic
+   - Cloud Run function (`process-document`) subscribes to topic
 
 2. **Document Processing**
    - Extract text (Cloud Document AI for PDFs, native parsers for JSON/CSV)
@@ -65,13 +190,13 @@ Retrieval-Augmented Generation (RAG) ensures grounded, citation-backed responses
    - Store embeddings + metadata in staging Cloud Storage (`gs://embeddings-staging/`)
 
 4. **Index Update Trigger**
-   - Staging bucket triggers another Cloud Function (`update-vector-index`)
+   - Staging bucket triggers another Cloud Run function (`update-vector-index`)
    - Function streams embeddings to **Vertex AI Vector Search index**
 
 **Key Design Decisions:**
 - **Batch size (250)**: Balances API quota limits with processing speed
 - **Overlapping chunks**: Prevents loss of context at chunk boundaries; critical for semantic coherence
-- **Streaming updates**: Real-time index updates vs. nightly batch rebuilds; streaming chosen for <5min freshness SLA
+- **Streaming updates**: Real-time index updates vs. nightly batch rebuilds; streaming chosen for typically <5min freshness (data availability)
 
 ### 2.2 Vector Search Service Configuration
 
@@ -214,9 +339,9 @@ Document Schema:
 ### 3.2 ReAct Loop Implementation Pattern
 
 **Service Stack:**
-- **Cloud Run (2nd Gen)**: Hosts LangGraph orchestrator service (Python FastAPI app)
+- **Cloud Run**: Hosts LangGraph orchestrator service (Python FastAPI app)
 - **Vertex AI Gemini API**: LLM reasoning engine
-- **Cloud Functions**: Individual tool implementations
+- **Cloud Run functions**: Individual tool implementations
 
 **Why Cloud Run over Cloud Workflows:**
 - **Flexibility**: ReAct loops require dynamic branching (not easily expressible in YAML-based Workflows)
@@ -255,7 +380,7 @@ graph TD
 
 3. **Tool Execution Node** (`execute_tool()`)
    - Input: Tool name + validated parameters
-   - Process: Invoke Cloud Function via HTTP POST (includes auth token)
+   - Process: Invoke Cloud Run function via HTTP POST (includes auth token)
    - Output: Tool result + error handling
    - Timeout: 30s per tool call (circuit breaker pattern)
 
@@ -271,13 +396,13 @@ graph TD
 
 ### 3.3 Tool Execution Framework
 
-**Service**: **Cloud Functions (2nd Gen)**
+**Service**: **Cloud Run functions**
 
-**Why Cloud Functions:**
+**Why Cloud Run functions:**
 - **Isolation**: Each tool is an independent function (security boundary)
 - **Scaling**: Auto-scale to zero when unused; scale to 1000+ concurrent for high load
 - **Versioning**: Deploy new tool versions without orchestrator changes
-- **Cost**: Pay-per-invocation (vs. always-on Cloud Run services)
+- **Resource efficiency**: Pay-per-invocation (vs. always-on Cloud Run services)
 
 **Tool Registry Pattern:**
 
@@ -309,10 +434,10 @@ LangGraph Orchestrator (Cloud Run)
   ↓ (1) Lookup tool schema in Firestore
   ↓ (2) Validate parameters
   ↓ (3) Generate IAM ID token for service account
-  ↓ (4) HTTP POST to Cloud Function endpoint
+  ↓ (4) HTTP POST to Cloud Run function endpoint
   ↓     Headers: {Authorization: "Bearer <id_token>"}
   ↓     Body: {parameters: {...}}
-Cloud Function (Tool Implementation)
+Cloud Run function (Tool Implementation)
   ↓ (5) Validate IAM token (only orchestrator SA can invoke)
   ↓ (6) Execute business logic (query BigQuery, call external API, etc.)
   ↓ (7) Return structured JSON response
@@ -326,8 +451,8 @@ Orchestrator
 
 | Layer | Control |
 |-------|---------|
-| **Network** | Cloud Functions deployed in VPC with Private Service Connect; no public internet access |
-| **IAM** | Only orchestrator service account can invoke tools (Cloud Function IAM binding) |
+| **Network** | Cloud Run functions deployed in VPC with Private Service Connect; no public internet access |
+| **IAM** | Only orchestrator service account can invoke tools (Cloud Run function IAM binding) |
 | **Input Validation** | JSON Schema validation before invocation; reject malformed requests |
 | **Output Sanitization** | PII redaction via Cloud DLP API before returning to LLM |
 | **Secrets** | External API keys stored in Secret Manager; accessed via Workload Identity |
@@ -338,6 +463,139 @@ Orchestrator
 3. Deploy via `gcloud functions deploy` with IAM bindings
 4. Register in Firestore `tools` collection
 5. Orchestrator auto-discovers new tool on next deployment
+
+### 3.4 Tool Invocation Sequence Diagram
+
+The following sequence diagram shows the detailed flow of tool invocation from LLM decision to result return:
+
+```mermaid
+sequenceDiagram
+    participant LLM as Vertex AI Gemini
+    participant Orch as LangGraph Orchestrator<br/>(Cloud Run)
+    participant FS as Firestore<br/>(Tool Registry)
+    participant IAM as Cloud IAM<br/>(Token Service)
+    participant CF as Cloud Run function<br/>(Tool Implementation)
+    participant BQ as BigQuery<br/>(Data Source)
+    participant SM as Secret Manager<br/>(API Keys)
+
+    Note over LLM,Orch: ReAct Loop - Tool Selection Phase
+    LLM->>Orch: Action: use_tool("fetch_q3_sales", {region: "AMER", category: "Software"})
+
+    Note over Orch,FS: Phase 1: Tool Discovery & Validation
+    Orch->>FS: GET /tools/fetch_q3_sales
+    FS-->>Orch: Tool Schema: {parameters_schema, endpoint_url, timeout, iam_service_account}
+
+    Orch->>Orch: Validate parameters against JSON Schema<br/>(ensure required fields present, types correct)
+    alt Validation Fails
+        Orch-->>LLM: Error: "Invalid parameters: missing 'region'"
+        Note over LLM,Orch: LLM self-corrects and retries
+    end
+
+    Note over Orch,IAM: Phase 2: Authentication Setup
+    Orch->>IAM: Request ID Token for tool-executor@project.iam<br/>Audience: https://us-central1-project.cloudfunctions.net/fetch-q3-sales
+    IAM-->>Orch: ID Token (JWT, valid 1 hour)
+
+    Note over Orch,CF: Phase 3: Tool Invocation
+    Orch->>CF: HTTP POST /fetch-q3-sales<br/>Headers: {Authorization: "Bearer <id_token>"}<br/>Body: {region: "AMER", category: "Software"}<br/>Timeout: 30s
+
+    Note over CF: Phase 4: Tool Execution
+    CF->>CF: Validate IAM Token<br/>(only orchestrator@ can invoke)
+
+    alt IAM Validation Fails
+        CF-->>Orch: 403 Forbidden: "Unauthorized service account"
+        Orch-->>LLM: Error: "Tool invocation failed: authorization error"
+    end
+
+    CF->>SM: Access Secret: "external_api_key"
+    SM-->>CF: Secret Value: "sk-abc123..."
+
+    CF->>BQ: Query: SELECT sales_amount, product_name<br/>FROM sales_data<br/>WHERE region='AMER' AND category='Software'<br/>AND quarter='Q3'
+    BQ-->>CF: Query Results: [{sales_amount: 125000, product_name: "CRM Pro"}, ...]
+
+    CF->>CF: Format Results:<br/>{<br/>  result: {total_sales: 500000, top_products: [...]},<br/>  citations: [{source: "sales_data", timestamp: "2025-11-05"}],<br/>  error: null<br/>}
+
+    Note over CF,Orch: Phase 5: Result Return
+    CF-->>Orch: 200 OK<br/>Body: {result: {...}, citations: [...], error: null}
+
+    Note over Orch: Phase 6: State Update
+    Orch->>FS: Update Session State:<br/>tool_results_cache["fetch_q3_sales"][params] = result
+    FS-->>Orch: Success
+
+    Note over Orch,LLM: Phase 7: Return to ReAct Loop
+    Orch-->>LLM: Observation: "Q3 sales for Software in AMER: $500K. Top product: CRM Pro ($125K)"
+
+    Note over LLM: LLM processes observation and decides next action<br/>(either call another tool or synthesize final response)
+
+    rect rgb(255, 240, 230)
+        Note over Orch,CF: Error Handling Scenarios
+    end
+
+    alt Tool Timeout (>30s)
+        CF--xOrch: (no response)
+        Orch->>Orch: Circuit Breaker: Cancel request
+        Orch-->>LLM: Error: "Tool timeout after 30s, partial results available"
+    end
+
+    alt Tool Returns Error
+        CF-->>Orch: 200 OK<br/>Body: {result: null, citations: [], error: "Database connection failed"}
+        Orch-->>LLM: Error: "Tool reported error: Database connection failed"
+        Note over LLM: LLM decides: retry, use different tool, or inform user
+    end
+
+    alt External API Failure
+        CF->>BQ: Query
+        BQ--xCF: 503 Service Unavailable
+        CF->>CF: Retry with Exponential Backoff (3 attempts)
+        alt Retries Exhausted
+            CF-->>Orch: 500 Internal Server Error<br/>Body: {error: "BigQuery unavailable after 3 retries"}
+            Orch-->>LLM: Error: "Data source unavailable, cannot fetch Q3 sales"
+        end
+    end
+```
+
+**Invocation Phases Explained**:
+
+1. **Tool Discovery (1-2s)**:
+   - Orchestrator queries Firestore for tool schema
+   - Validates parameters against JSON Schema
+   - Rejects invalid requests before invocation (fast fail)
+
+2. **Authentication (100-200ms)**:
+   - Generate IAM ID token for tool service account
+   - Token cached and reused for 55 minutes (5-min buffer before expiry)
+   - Zero-trust: Each tool invocation verified by IAM
+
+3. **Invocation (100ms-30s)**:
+   - HTTP POST to Cloud Function with ID token
+   - Function validates token (blocks unauthorized callers)
+   - Timeout enforced by orchestrator (circuit breaker pattern)
+
+4. **Execution (varies)**:
+   - Tool accesses secrets from Secret Manager (cached after first access)
+   - Queries data sources (BigQuery, external APIs, etc.)
+   - Formats structured response (result, citations, error)
+
+5. **Result Return (50-100ms)**:
+   - Structured JSON response with consistent schema
+   - Citations for audit trail
+   - Explicit error field (never throws exceptions to orchestrator)
+
+6. **State Update (50ms)**:
+   - Cache tool results in Firestore (deduplication for repeated calls)
+   - Update conversation history with tool observation
+   - Transactional update (ensures consistency)
+
+7. **ReAct Loop Continuation**:
+   - Return observation to LLM
+   - LLM processes and decides next action
+   - Loop continues until final response ready
+
+**Key Design Patterns**:
+- **Circuit Breaker**: 30s timeout prevents hung requests
+- **Retry Logic**: Exponential backoff for transient failures (BigQuery, external APIs)
+- **Result Caching**: Dedupe identical tool calls within same conversation
+- **Structured Errors**: Tools never throw exceptions; always return `{error: ...}` for orchestrator to handle
+- **Security**: Zero-trust IAM validation on every invocation (no API keys passed in headers)
 
 ---
 
@@ -374,11 +632,11 @@ Global Load Balancer (routes by client geo)
 
 **Index Refresh Strategies:**
 
-| Strategy | Use Case | Latency | Cost |
-|----------|----------|---------|------|
-| **Stream Update** | Real-time apps (chat, support) | <5 min | Higher (constant compute) |
-| **Hourly Batch** | Near real-time (dashboards) | 1 hour | Medium |
-| **Daily Batch** | Static corpora (docs, wikis) | 24 hours | Lower (scheduled jobs) |
+| Strategy | Use Case | Latency |
+|----------|----------|---------|
+| **Stream Update** | Real-time apps (chat, support) | <5 min |
+| **Hourly Batch** | Near real-time (dashboards) | 1 hour |
+| **Daily Batch** | Static corpora (docs, wikis) | 24 hours |
 
 **Sharding Strategy:**
 - **Auto-sharding** (default): Managed by Vertex AI; splits index at ~10M vectors per shard
@@ -393,16 +651,20 @@ The `TREE_AH` algorithm exposes two key parameters:
 
 | Parameter | Default | Tuning Guidance |
 |-----------|---------|-----------------|
-| **num_leaves_to_search** | 10 | ↑ = higher recall, ↑ latency (range: 5-50) |
-| **leaf_node_embedding_count** | 1000 | ↑ = better accuracy, ↑ memory (range: 500-10000) |
+| **fractionLeafNodesToSearch** | 0.05 (5%) | ↑ = higher recall, ↑ latency (range: 0.01-0.50, i.e., 1%-50%) |
+| **leafNodeEmbeddingCount** | 1000 | ↑ = better accuracy, ↑ memory (range: 500-10000) |
+
+**Note**: `num_leaves_to_search` and `leafNodesToSearchPercent` are deprecated parameters; use `fractionLeafNodesToSearch` instead.
 
 **Recall vs. Latency Tradeoff:**
 
-| Workload | Target Recall | `num_leaves_to_search` | p99 Latency | Cost Multiplier |
-|----------|---------------|------------------------|-------------|-----------------|
-| High-precision (legal, medical) | 98%+ | 30-50 | 80-120ms | 2-3x baseline |
-| Balanced (general RAG) | 95% | 10-15 | 40-60ms | 1x baseline |
-| High-throughput (suggestion) | 90% | 5-8 | 20-30ms | 0.5x baseline |
+| Workload | Target Recall | `fractionLeafNodesToSearch` | p99 Latency |
+|----------|---------------|----------------------------|-------------|
+| High-precision (legal, medical) | 98%+ | 0.30-0.50 (30%-50%) | 80-120ms |
+| Balanced (general RAG) | 95% | 0.10-0.15 (10%-15%) | 50-100ms |
+| High-throughput (suggestion) | 90% | 0.05-0.08 (5%-8%) | 30-60ms |
+
+**Note**: p99 latency varies based on index size, machine type, and configuration. Values shown are typical for optimized workloads.
 
 **Query Optimization Patterns:**
 
@@ -420,14 +682,14 @@ The `TREE_AH` algorithm exposes two key parameters:
    - TTL: 1 hour (balance freshness and hit rate)
    - Cache key: hash of query embedding (deterministic)
 
-**Cost Optimization:**
+**Performance vs. Resource Tradeoffs:**
 
-| Technique | Savings | Tradeoff |
-|-----------|---------|----------|
-| Reduce `num_leaves_to_search` | 30-50% | Lower recall (test before deploying) |
-| Batch index updates (hourly vs. streaming) | 60% | Higher data freshness latency |
-| Use Standard tier vs. High-scale tier | 40% | Lower QPS limits (500 vs. 10K) |
-| Pre-filter candidates via metadata | 20% | Requires additional metadata indexing |
+| Technique | Resource Impact | Tradeoff |
+|-----------|-----------------|----------|
+| Reduce `num_leaves_to_search` | Lower compute requirements | Lower recall (test before deploying) |
+| Batch index updates (hourly vs. streaming) | Reduced continuous compute | Higher data freshness latency |
+| Use Standard tier vs. High-scale tier | Lower resource allocation | Lower QPS limits (500 vs. 10K) |
+| Pre-filter candidates via metadata | Additional metadata indexing | Faster queries for filtered searches |
 
 ### 4.3 Scaling Patterns
 
@@ -468,7 +730,7 @@ The `TREE_AH` algorithm exposes two key parameters:
 - **Problem**: First query after index endpoint idle > 15 min incurs 2-5s cold start
 - **Solution 1**: Periodic health checks (Cloud Scheduler → ping endpoint every 5 min)
 - **Solution 2**: Pre-warming (issue dummy queries on deployment)
-- **Solution 3**: Use "always-on" tier for critical applications (no cold starts, higher cost)
+- **Solution 3**: Use "always-on" tier for critical applications (no cold starts)
 
 ---
 
@@ -589,6 +851,135 @@ Vertex AI Endpoints (private IP)
 
 **No public internet access** for internal services (orchestrator, tools, databases).
 
+### 5.4 Security Boundary Diagram
+
+The following diagram shows VPC layout, service accounts, and IAM security boundaries:
+
+```mermaid
+graph TB
+    subgraph "Internet - Public Zone"
+        Internet[Internet Clients]
+    end
+
+    subgraph "Edge Security Layer"
+        GLB[Global Load Balancer<br/>DDoS Protection]
+        CloudArmor[Cloud Armor WAF<br/>OWASP Top 10 Rules]
+    end
+
+    subgraph "VPC - vpc-agentic-ai-prod (10.0.0.0/16)"
+        subgraph "DMZ Subnet (10.0.1.0/24)"
+            APIGateway[API Gateway<br/>Public Endpoint]
+        end
+
+        subgraph "Private Subnet - Orchestration (10.0.2.0/24)"
+            Orchestrator[Cloud Run Orchestrator<br/>SA: orchestrator@project.iam]
+        end
+
+        subgraph "Private Subnet - Tools (10.0.3.0/24)"
+            CF1[Cloud Run function Tools<br/>SA: tool-executor@project.iam]
+        end
+
+        subgraph "Private Subnet - Data Processing (10.0.4.0/24)"
+            ProcessFunc[Cloud Run functions<br/>SA: indexer@project.iam]
+        end
+    end
+
+    subgraph "Google-Managed Services - Private Service Connect"
+        VertexAI[Vertex AI<br/>Private Endpoint<br/>10.0.10.0/29]
+        VectorSearch[Vector Search<br/>Private Endpoint<br/>10.0.10.8/29]
+        Firestore[Firestore<br/>Private Access]
+    end
+
+    subgraph "Storage Layer - Private Access Only"
+        GCS[Cloud Storage<br/>Private Access]
+        SecretMgr[Secret Manager<br/>Private Access]
+        BigQuery[BigQuery<br/>Private Access]
+    end
+
+    subgraph "IAM Policies & Service Accounts"
+        direction LR
+        SA_Orch[orchestrator@project.iam<br/>Roles:<br/>- aiplatform.user<br/>- datastore.user<br/>- cloudfunctions.invoker]
+        SA_Tool[tool-executor@project.iam<br/>Roles:<br/>- bigquery.dataViewer<br/>- storage.objectViewer<br/>- secretmanager.secretAccessor]
+        SA_Index[indexer@project.iam<br/>Roles:<br/>- aiplatform.user<br/>- storage.objectViewer<br/>- datastore.user]
+    end
+
+    %% Traffic flows with security controls
+    Internet -->|HTTPS:443| GLB
+    GLB -->|Security Scan| CloudArmor
+    CloudArmor -->|Allowed Traffic| APIGateway
+
+    APIGateway -->|OAuth 2.0 ID Token| Orchestrator
+
+    Orchestrator -->|IAM Auth<br/>Private Connect| VertexAI
+    Orchestrator -->|IAM Auth<br/>Private Connect| VectorSearch
+    Orchestrator -->|IAM Auth| Firestore
+    Orchestrator -->|IAM ID Token| CF1
+
+    CF1 -->|IAM Auth| BigQuery
+    CF1 -->|IAM Auth| SecretMgr
+
+    ProcessFunc -->|IAM Auth| GCS
+    ProcessFunc -->|IAM Auth<br/>Private Connect| VertexAI
+    ProcessFunc -->|IAM Auth<br/>Private Connect| VectorSearch
+    ProcessFunc -->|IAM Auth| Firestore
+
+    %% Security controls
+    APIGateway -.->|Egress Firewall Rule| Orchestrator
+    Orchestrator -.->|Egress Firewall Rule| VertexAI
+    Orchestrator -.->|Egress Firewall Rule| VectorSearch
+    CF1 -.->|Egress Firewall Rule| BigQuery
+
+    style Internet fill:#ffebee
+    style CloudArmor fill:#fff3e0
+    style APIGateway fill:#e3f2fd
+    style Orchestrator fill:#f3e5f5
+    style CF1 fill:#e8f5e9
+    style ProcessFunc fill:#e8f5e9
+    style VertexAI fill:#fce4ec
+    style VectorSearch fill:#fce4ec
+    style Firestore fill:#fff9c4
+    style GCS fill:#fff9c4
+```
+
+**Security Layers**:
+
+1. **Perimeter Security**:
+   - Global Load Balancer: DDoS protection, SSL termination
+   - Cloud Armor: WAF with OWASP Top 10 rules, rate limiting, geo-blocking
+
+2. **Network Segmentation**:
+   - DMZ Subnet: API Gateway (only public-facing component)
+   - Private Subnets: Orchestrator, Tools, Processing (no direct internet access)
+   - Private Service Connect: Google-managed services (Vertex AI, Vector Search) accessed via private IPs
+
+3. **Authentication & Authorization**:
+   - **Client → API Gateway**: OAuth 2.0 / API Keys
+   - **API Gateway → Orchestrator**: OAuth 2.0 ID Token
+   - **Orchestrator → Tools**: IAM ID Token (only orchestrator SA can invoke)
+   - **Tools → Services**: IAM authentication with least-privilege service accounts
+
+4. **Service Account Isolation**:
+   - **orchestrator@**: Can call Vertex AI, Firestore, and invoke Cloud Functions (no direct BigQuery access)
+   - **tool-executor@**: Can read BigQuery, Cloud Storage, Secret Manager (no write access to Firestore)
+   - **indexer@**: Can write to Vector Search and Firestore (no access to BigQuery or tools)
+
+5. **Firewall Rules**:
+   - **Ingress**: Only from GLB to API Gateway (port 443)
+   - **Egress**: Orchestrator → only Vertex AI, Vector Search, Firestore, Cloud Functions (deny all other)
+   - **Internal**: Private subnets can communicate via VPC peering (controlled by service accounts)
+
+6. **Data Protection**:
+   - All data encrypted at rest (Google-managed keys by default, CMEK optional)
+   - All data encrypted in transit (TLS 1.3)
+   - Secret Manager for API keys (no secrets in code or environment variables)
+   - Cloud Storage: Bucket-level IAM (no public access)
+
+**Compliance Controls**:
+- **VPC Service Controls**: Optional perimeter for additional data exfiltration protection
+- **Binary Authorization**: Enforce only signed container images in Cloud Run
+- **Access Transparency**: Logs of Google personnel access to customer data
+- **Audit Logs**: Cloud Audit Logs for all API calls (Admin, Data Access, System Event)
+
 ---
 
 ## **6. Architectural Decision Records (ADRs)**
@@ -617,7 +1008,7 @@ Key design decisions with documented rationale and tradeoffs.
 - Firestore's document model naturally maps to sessions (vs. Redis's key-value)
 - Auto-scaling eliminates capacity planning (critical for unpredictable workloads)
 - Real-time listeners enable streaming updates without polling
-- Cost: Firestore cheaper for read-heavy workloads (90% reads, 10% writes)
+- Efficient for read-heavy workloads (90% reads, 10% writes)
 
 **Tradeoffs Accepted**:
 - Limited query flexibility (can't join sessions with user profiles in single query)
@@ -625,9 +1016,9 @@ Key design decisions with documented rationale and tradeoffs.
 
 ---
 
-### ADR-2: Cloud Run vs. Cloud Functions for LangGraph Orchestrator
+### ADR-2: Cloud Run vs. Cloud Run functions for LangGraph Orchestrator
 
-**Decision**: Use Cloud Run (2nd Gen)
+**Decision**: Use Cloud Run
 
 **Context**: ReAct loop requires:
 - Dynamic control flow (loops, conditionals)
@@ -640,17 +1031,17 @@ Key design decisions with documented rationale and tradeoffs.
 | Option | Pros | Cons |
 |--------|------|------|
 | **Cloud Run** | Full Python environment, SSE support, 60-min timeout, CPU/memory tuning | Slightly higher cold start (1-2s) |
-| **Cloud Functions** | Faster cold start (<500ms), simpler deployment | 9-min timeout, no SSE, limited libraries |
+| **Cloud Run functions** | Faster cold start (<500ms), simpler deployment | 9-min timeout, no SSE, limited libraries |
 | **Cloud Workflows** | Visual DAG, auto-retries, built-in error handling | YAML-based (not code), no streaming, slow iteration |
 
 **Rationale**:
-- LangGraph SDK requires full Python runtime (Cloud Functions too restrictive)
+- LangGraph SDK requires full Python runtime (Cloud Run functions too restrictive)
 - Streaming critical for UX (show reasoning steps in real-time)
 - 60-min timeout accommodates complex multi-tool queries
 - Cold start mitigated by min-instances=1 for production
 
 **Tradeoffs Accepted**:
-- Higher cost than Functions (always-on min-instances vs. scale-to-zero)
+- Higher resource usage than Cloud Run functions (always-on min-instances vs. scale-to-zero)
 - Cold start penalty for dev environments (acceptable for non-prod)
 
 ---
@@ -666,19 +1057,19 @@ Key design decisions with documented rationale and tradeoffs.
 
 **Options Considered**:
 
-| Option | Freshness | Cost | Complexity |
-|--------|-----------|------|------------|
+| Option | Freshness | Resource Usage | Complexity |
+|--------|-----------|----------------|------------|
 | **Streaming** | <5 min | High (continuous indexing) | Low (managed by Vertex AI) |
 | **Hourly Batch** | 1 hour | Medium (scheduled jobs) | Medium (Cloud Scheduler + Cloud Run) |
 | **Daily Batch** | 24 hours | Low (single daily job) | Low |
 
 **Rationale**:
 - Production workload (customer support) requires <5min freshness for new docs
-- Cost justified by user experience improvement (customers find latest docs)
+- User experience improvement justifies higher resource usage (customers find latest docs)
 - Analytics workload (internal dashboards) can tolerate daily updates (separate index)
 
 **Tradeoffs Accepted**:
-- 2-3x higher indexing cost vs. batch (but still <5% of total GCP spend)
+- Higher continuous resource usage vs. batch updates
 - More complex monitoring (need alerts for stream lag)
 
 ---
@@ -718,17 +1109,15 @@ Practical deployment configurations for different scales and requirements.
 
 ### 7.1 Development Environment
 
-**Goal**: Low-cost, fast iteration, single developer
+**Goal**: Fast iteration, single developer, minimal resource usage
 
 ```
 Architecture:
 - Cloud Run (orchestrator): min-instances=0 (scale to zero)
 - Vertex AI Vector Search: Standard tier (500 QPS limit)
 - Firestore: Native mode (no setup)
-- Cloud Functions: 2nd Gen (scale to zero)
+- Cloud Run functions: Scale to zero
 - No VPC (public endpoints for simplicity)
-
-Cost Estimate: ~$50-100/month (mostly Vertex AI API calls)
 ```
 
 **Deployment Commands**:
@@ -763,11 +1152,10 @@ Architecture:
   - High-scale tier (10K QPS)
   - 3 index endpoint replicas
 - Firestore: Multi-region (nam5)
-- Cloud Functions: min-instances=1 per tool
+- Cloud Run functions: min-instances=1 per tool
 - Regional Load Balancer + Cloud Armor WAF
 
 Region: us-central1 (Iowa)
-Cost Estimate: ~$2,000-3,000/month
 ```
 
 **Key Configurations**:
@@ -794,8 +1182,6 @@ Architecture:
 - Global Load Balancer (geo-routing)
 - Cloud CDN (cache static responses)
 - Cross-region Cloud Storage (index replication)
-
-Cost Estimate: ~$8,000-12,000/month
 ```
 
 **Data Replication Strategy**:
@@ -807,18 +1193,145 @@ Cost Estimate: ~$8,000-12,000/month
 - Global Load Balancer auto-routes to healthy region (health check every 10s)
 - Cross-region failover time: <30s (DNS TTL=60s)
 
+**Multi-Region Topology Diagram**:
+
+```mermaid
+graph TB
+    subgraph "Global Entry Point"
+        Client[Global Clients]
+        GLB[Global Load Balancer<br/>Anycast IP: 34.120.x.x]
+        CloudCDN[Cloud CDN<br/>Edge Caching]
+    end
+
+    subgraph "Americas Region - us-central1"
+        subgraph "US VPC (10.1.0.0/16)"
+            US_API[API Gateway US]
+            US_Orch[Cloud Run Orchestrator<br/>min-instances=5]
+            US_Tools[Cloud Run functions<br/>Tool Execution]
+        end
+        US_Vector[Vector Search Endpoint<br/>us-central1]
+        US_Firestore[Firestore<br/>nam5 Multi-Region]
+        US_GCS[Cloud Storage<br/>us-central1]
+    end
+
+    subgraph "EMEA Region - europe-west1"
+        subgraph "EU VPC (10.2.0.0/16)"
+            EU_API[API Gateway EU]
+            EU_Orch[Cloud Run Orchestrator<br/>min-instances=5]
+            EU_Tools[Cloud Run functions<br/>Tool Execution]
+        end
+        EU_Vector[Vector Search Endpoint<br/>europe-west1]
+        EU_Firestore[Firestore<br/>eur3 Multi-Region]
+        EU_GCS[Cloud Storage<br/>europe-west1]
+    end
+
+    subgraph "APAC Region - asia-southeast1"
+        subgraph "APAC VPC (10.3.0.0/16)"
+            APAC_API[API Gateway APAC]
+            APAC_Orch[Cloud Run Orchestrator<br/>min-instances=5]
+            APAC_Tools[Cloud Run functions<br/>Tool Execution]
+        end
+        APAC_Vector[Vector Search Endpoint<br/>asia-southeast1]
+        APAC_Firestore[Firestore<br/>asia1 Multi-Region]
+        APAC_GCS[Cloud Storage<br/>asia-southeast1]
+    end
+
+    subgraph "Global Services - Shared"
+        VertexAI[Vertex AI Gemini API<br/>Multi-Region]
+        SecretMgr[Secret Manager<br/>Replicated to all regions]
+        BigQuery[BigQuery<br/>Multi-Region Dataset]
+    end
+
+    subgraph "Cross-Region Replication"
+        IndexRepl[Vector Search Index Files<br/>Cross-Region Sync]
+    end
+
+    %% Client routing
+    Client -->|HTTPS Request| GLB
+    GLB -->|Cache Hit| CloudCDN
+    GLB -->|Americas Traffic<br/>Geo-Routing| US_API
+    GLB -->|EMEA Traffic<br/>Geo-Routing| EU_API
+    GLB -->|APAC Traffic<br/>Geo-Routing| APAC_API
+
+    %% US Region flows
+    US_API --> US_Orch
+    US_Orch --> US_Vector
+    US_Orch --> US_Firestore
+    US_Orch --> US_Tools
+    US_Orch --> VertexAI
+    US_Tools --> BigQuery
+    US_Tools --> SecretMgr
+    US_Vector --> US_GCS
+
+    %% EU Region flows
+    EU_API --> EU_Orch
+    EU_Orch --> EU_Vector
+    EU_Orch --> EU_Firestore
+    EU_Orch --> EU_Tools
+    EU_Orch --> VertexAI
+    EU_Tools --> BigQuery
+    EU_Tools --> SecretMgr
+    EU_Vector --> EU_GCS
+
+    %% APAC Region flows
+    APAC_API --> APAC_Orch
+    APAC_Orch --> APAC_Vector
+    APAC_Orch --> APAC_Firestore
+    APAC_Orch --> APAC_Tools
+    APAC_Orch --> VertexAI
+    APAC_Tools --> BigQuery
+    APAC_Tools --> SecretMgr
+    APAC_Vector --> APAC_GCS
+
+    %% Cross-region replication
+    IndexRepl -.->|Sync Index Files| US_GCS
+    IndexRepl -.->|Sync Index Files| EU_GCS
+    IndexRepl -.->|Sync Index Files| APAC_GCS
+
+    US_Firestore <-.->|Multi-Region<br/>Replication| EU_Firestore
+    EU_Firestore <-.->|Multi-Region<br/>Replication| APAC_Firestore
+    APAC_Firestore <-.->|Multi-Region<br/>Replication| US_Firestore
+
+    style Client fill:#e1f5ff
+    style GLB fill:#fff4e6
+    style US_Orch fill:#e8f5e9
+    style EU_Orch fill:#e8f5e9
+    style APAC_Orch fill:#e8f5e9
+    style VertexAI fill:#f3e5f5
+    style US_Firestore fill:#fff9c4
+    style EU_Firestore fill:#fff9c4
+    style APAC_Firestore fill:#fff9c4
+```
+
+**Routing Strategy**:
+- **Geographic Routing**: Global Load Balancer routes requests to nearest region based on client IP
+- **Health Check Based**: Automatic failover to next-nearest healthy region if primary region unavailable
+- **Cache Strategy**: Cloud CDN caches static responses at 200+ edge locations globally
+
+**Data Consistency**:
+- **Firestore**: Multi-region replication with eventual consistency (<1s propagation)
+- **Vector Search Indices**: Asynchronous replication via Cloud Storage cross-region sync (hourly batch)
+- **Secrets**: Replicated to Secret Manager in each region (manual sync on update)
+- **BigQuery**: Multi-region dataset (data replicated across regions automatically)
+
+**Latency Targets**:
+- **Americas → us-central1**: <50ms (in-region)
+- **EMEA → europe-west1**: <60ms (in-region)
+- **APAC → asia-southeast1**: <70ms (in-region)
+- **Cross-region failover**: Additional 100-150ms (acceptable for reliability)
+
 ---
 
-### 7.4 Cost-Optimized (Batch Workload)
+### 7.4 Batch Processing Workload
 
-**Goal**: Process 1M documents/day, cost <$500/month
+**Goal**: Process large document volumes efficiently
 
 ```
 Architecture:
 - Cloud Run (orchestrator): Scheduled job (Cloud Scheduler)
 - Vector Search: Batch index updates (daily at 2am)
-- Cloud Functions: Scale to zero between batches
-- BigQuery: On-demand pricing (not slots)
+- Cloud Run functions: Scale to zero between batches
+- BigQuery: On-demand queries
 - Preemptible VMs for document processing
 
 Processing Flow:
@@ -827,13 +1340,6 @@ Processing Flow:
 3. Batch embed (250 docs/call to Vertex AI)
 4. Update Vector Search index (single batch operation)
 5. Job completes, all services scale to zero
-
-Cost Breakdown:
-- Vertex AI embedding: $0.025 per 1K docs = $25/day
-- Vector Search: Batch updates = $50/month
-- Cloud Run: 30 min/day = $10/month
-- Cloud Functions: Negligible (scale to zero)
-Total: ~$800/month (mostly embeddings)
 ```
 
 ---
@@ -854,7 +1360,7 @@ This deep-dive covered the systems-level architecture for an Agentic AI framewor
 
 5. **Architectural Decisions**: Documented tradeoffs (Firestore vs. Redis, Cloud Run vs. Functions, streaming vs. batch) guide future design choices.
 
-6. **Deployment Topologies**: Ranged from $50/month dev environments to $12K/month global production systems.
+6. **Deployment Topologies**: Configurations ranging from minimal dev environments to global production systems with 99.9% uptime.
 
 ### Next Steps
 
